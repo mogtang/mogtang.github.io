@@ -1,0 +1,357 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#111827">
+  <title>本棚スキャナー</title>
+  <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Noto Sans JP", sans-serif;
+      background: #111827;
+      color: #fff;
+    }
+    header {
+      padding: 14px 16px 10px;
+      padding-top: max(14px, env(safe-area-inset-top));
+    }
+    h1 { margin: 0 0 10px; font-size: 20px; }
+    .search {
+      display: flex;
+      gap: 8px;
+    }
+    input, button {
+      min-height: 44px;
+      border: 0;
+      border-radius: 10px;
+      font-size: 16px;
+    }
+    input {
+      flex: 1;
+      padding: 0 12px;
+    }
+    button {
+      padding: 0 15px;
+      background: #2563eb;
+      color: #fff;
+      font-weight: 700;
+    }
+    button:disabled { opacity: .5; }
+    main { padding: 0 12px 20px; }
+    .camera {
+      position: relative;
+      overflow: hidden;
+      border-radius: 14px;
+      background: #000;
+      aspect-ratio: 3 / 4;
+    }
+    video {
+      display: block;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+    }
+    #overlay {
+      display: block;
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      pointer-events: none;
+    }
+    #canvas { display: none; }
+    .status {
+      margin: 10px 2px;
+      min-height: 22px;
+      font-size: 14px;
+      color: #d1d5db;
+    }
+    .result {
+      padding: 12px;
+      border-radius: 10px;
+      background: #1f2937;
+      font-size: 14px;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .match {
+      margin-top: 8px;
+      padding: 10px;
+      border-left: 4px solid #facc15;
+      background: #3f3f46;
+    }
+    .note {
+      color: #9ca3af;
+      font-size: 12px;
+      line-height: 1.6;
+      margin-top: 10px;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>📚 本棚スキャナー</h1>
+    <div class="search">
+      <input id="keyword" type="search" placeholder="探したい文字列（例：PHP）" value="PHP">
+      <button id="startBtn">カメラ開始</button>
+    </div>
+  </header>
+
+  <main>
+    <div class="camera" id="camera">
+      <video id="video" autoplay playsinline muted></video>
+      <canvas id="overlay"></canvas>
+    </div>
+
+    <canvas id="canvas"></canvas>
+
+    <div id="status" class="status">「カメラ開始」を押してください。</div>
+
+    <div id="result" class="result">OCR結果はここに表示されます。</div>
+
+    <div class="note">
+      ※ 最初のMVPでは、カメラ映像から定期的に画像を取得してOCRします。
+      HTTPS環境（または localhost）が必要です。日本語OCRデータの読み込みに時間がかかる場合があります。
+    </div>
+  </main>
+
+  <script>
+    const video = document.getElementById("video");
+    const canvas = document.getElementById("canvas");
+    const overlay = document.getElementById("overlay");
+    const keywordInput = document.getElementById("keyword");
+    const startBtn = document.getElementById("startBtn");
+    const statusEl = document.getElementById("status");
+    const resultEl = document.getElementById("result");
+
+    let stream = null;
+    let worker = null;
+    let scanning = false;
+    let busy = false;
+
+    async function startCamera() {
+      if (!navigator.mediaDevices?.getUserMedia) {
+        throw new Error("このブラウザではカメラAPIを利用できません。HTTPSでアクセスしてください。");
+      }
+
+      stream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          facingMode: { ideal: "environment" },
+          width: { ideal: 1280 },
+          height: { ideal: 720 }
+        },
+        audio: false
+      });
+
+      video.srcObject = stream;
+      await video.play();
+    }
+
+    async function initOCR() {
+      statusEl.textContent = "日本語OCRを準備しています…";
+
+      worker = await Tesseract.createWorker("jpn", 1, {
+        logger: message => {
+          if (message.status === "loading tesseract core") {
+            statusEl.textContent = "OCRエンジンを読み込んでいます…";
+          } else if (message.status === "loading language traineddata") {
+            statusEl.textContent =
+              `日本語データを読み込んでいます… ${Math.round((message.progress || 0) * 100)}%`;
+          } else if (message.status === "recognizing text") {
+            statusEl.textContent =
+              `文字を認識しています… ${Math.round((message.progress || 0) * 100)}%`;
+          }
+        }
+      });
+
+      // 日本語の認識精度を少し上げるための設定。
+      await worker.setParameters({
+        preserve_interword_spaces: "1"
+      });
+    }
+
+    function captureFrame() {
+      const maxWidth = 1280;
+      const scale = Math.min(1, maxWidth / video.videoWidth);
+
+      canvas.width = Math.round(video.videoWidth * scale);
+      canvas.height = Math.round(video.videoHeight * scale);
+
+      const ctx = canvas.getContext("2d", { willReadFrequently: true });
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+      return canvas;
+    }
+
+    function normalize(text) {
+      return text
+        .toLowerCase()
+        .replace(/\s+/g, "")
+        .replace(/[Ａ-Ｚａ-ｚ０-９]/g, c =>
+          String.fromCharCode(c.charCodeAt(0) - 0xfee0)
+        );
+    }
+
+    function clearOverlay() {
+      const ctx = overlay.getContext("2d");
+      ctx.clearRect(0, 0, overlay.width, overlay.height);
+    }
+
+    function setupOverlay() {
+      // Canvas coordinates are based on the displayed camera area.
+      const rect = video.getBoundingClientRect();
+      overlay.width = Math.round(rect.width * window.devicePixelRatio);
+      overlay.height = Math.round(rect.height * window.devicePixelRatio);
+    }
+
+    function drawMatches(words, keyword, imageWidth, imageHeight) {
+      setupOverlay();
+
+      const ctx = overlay.getContext("2d");
+      const dpr = window.devicePixelRatio || 1;
+      const scaleX = overlay.width / imageWidth;
+      const scaleY = overlay.height / imageHeight;
+
+      ctx.clearRect(0, 0, overlay.width, overlay.height);
+
+      const normalizedKeyword = normalize(keyword);
+
+      for (const word of words || []) {
+        const text = (word.text || "").trim();
+        if (!text) continue;
+
+        if (!normalize(text).includes(normalizedKeyword)) continue;
+
+        const b = word.bbox;
+        if (!b) continue;
+
+        const x = b.x0 * scaleX;
+        const y = b.y0 * scaleY;
+        const w = (b.x1 - b.x0) * scaleX;
+        const h = (b.y1 - b.y0) * scaleY;
+
+        // Yellow highlight
+        ctx.fillStyle = "rgba(250, 204, 21, 0.22)";
+        ctx.fillRect(x, y, w, h);
+
+        ctx.strokeStyle = "#facc15";
+        ctx.lineWidth = Math.max(3, 2 * dpr);
+        ctx.strokeRect(x, y, w, h);
+
+        ctx.font = `bold ${Math.max(14, 14 * dpr)}px system-ui, sans-serif`;
+        const label = "FOUND";
+        const labelW = ctx.measureText(label).width + 12 * dpr;
+        const labelH = 22 * dpr;
+
+        ctx.fillStyle = "#facc15";
+        ctx.fillRect(x, Math.max(0, y - labelH), labelW, labelH);
+
+        ctx.fillStyle = "#111827";
+        ctx.fillText(label, x + 6 * dpr, Math.max(15 * dpr, y - 6 * dpr));
+      }
+    }
+
+    window.addEventListener("resize", () => {
+      if (video.readyState >= 2) {
+        setupOverlay();
+      }
+    });
+
+    async function scanOnce() {
+      if (!worker || busy || video.readyState < 2) return;
+
+      const keyword = keywordInput.value.trim();
+      if (!keyword) {
+        statusEl.textContent = "検索文字列を入力してください。";
+        return;
+      }
+
+      busy = true;
+
+      try {
+        clearOverlay();
+
+        const image = captureFrame();
+        const { data } = await worker.recognize(image);
+
+        const text = data.text.trim();
+        const normalizedText = normalize(text);
+        const normalizedKeyword = normalize(keyword);
+
+        resultEl.textContent = text || "文字を認識できませんでした。";
+
+        // OCRが返した単語ごとの座標をカメラ映像上に重ねる。
+        drawMatches(
+          data.words,
+          keyword,
+          image.width,
+          image.height
+        );
+
+        if (normalizedText.includes(normalizedKeyword)) {
+          resultEl.innerHTML =
+            `<div><strong>🔎 発見しました！</strong></div>` +
+            `<div class="match">${escapeHtml(text)}</div>`;
+          statusEl.textContent = `「${keyword}」を含む文字を発見しました。`;
+        } else {
+          statusEl.textContent = `「${keyword}」はまだ見つかりません。`;
+        }
+      } catch (error) {
+        console.error(error);
+        statusEl.textContent = "OCR中にエラーが発生しました。";
+      } finally {
+        busy = false;
+      }
+    }
+
+    function escapeHtml(text) {
+      return text
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
+    }
+
+    async function start() {
+      startBtn.disabled = true;
+
+      try {
+        await startCamera();
+        await initOCR();
+
+        scanning = true;
+        statusEl.textContent = "カメラを本棚に向けてください。";
+
+        // OCRを連続実行するとスマホが重くなるため、まずは3秒間隔。
+        while (scanning) {
+          await scanOnce();
+          await new Promise(resolve => setTimeout(resolve, 3000));
+        }
+      } catch (error) {
+        console.error(error);
+        statusEl.textContent = error.message || "開始できませんでした。";
+      } finally {
+        startBtn.disabled = false;
+      }
+    }
+
+    startBtn.addEventListener("click", start);
+
+    window.addEventListener("pagehide", async () => {
+      scanning = false;
+
+      if (stream) {
+        stream.getTracks().forEach(track => track.stop());
+      }
+
+      if (worker) {
+        await worker.terminate();
+      }
+    });
+  </script>
+</body>
+</html>
